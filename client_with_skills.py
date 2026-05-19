@@ -1,4 +1,4 @@
-""" ╔══════════════════════════════════════════════════════════════════╗ ║          Ultra-Advanced MCP Client  —  Claude-Code Style         ║ ╠══════════════════════════════════════════════════════════════════╣ ║  MCP Primitives                                                  ║ ║    ● Tools        agentic loop · parallel execution · registry   ║ ║    ● Resources    list · read · templates · live subscribe       ║ ║    ● Prompts      list · expand args · inject into conversation  ║ ║    ● Elicitation  server-driven structured user-input            ║ ║    ● Sampling     server-initiated LLM completions               ║ ║    ● Logging      rich server log display                        ║ ║    ● Progress     live progress from server notifications        ║ ║    ● Roots        expose local filesystem paths to servers       ║ ╠══════════════════════════════════════════════════════════════════╣ ║  Slash Commands                                                   ║ ║    /help  /tools  /resources  /read <uri>  /prompts              ║ ║    /prompt <name> [key=val]  /servers  /history  /clear          ║ ║    /roots  /roots add <path>  /stream  /export                   ║ ╚══════════════════════════════════════════════════════════════════╝ """
+""" ╔══════════════════════════════════════════════════════════════════╗ ║          Ultra-Advanced MCP Client  —  Claude-Code Style         ║ ╠══════════════════════════════════════════════════════════════════╣ ║  MCP Primitives                                                  ║ ║    ● Tools        agentic loop · parallel execution · registry   ║ ║    ● Resources    list · read · templates · live subscribe       ║ ║    ● Prompts      list · expand args · inject into conversation  ║ ║    ● Elicitation  server-driven structured user-input            ║ ║    ● Sampling     server-initiated LLM completions               ║ ║    ● Logging      rich server log display                        ║ ║    ● Progress     live progress from server notifications        ║ ║    ● Roots        expose local filesystem paths to servers       ║ ╠══════════════════════════════════════════════════════════════════╣ ║  Skills System  (Claude-Code style)                              ║ ║    ● Auto-matched from ~/.mcp_client/skills/*.md                 ║ ║    ● YAML frontmatter: name · description · triggers · priority  ║ ║    ● Injected as plan preamble into system prompt                ║ ║    ● Pin / disable / manual-activate per session                 ║ ╠══════════════════════════════════════════════════════════════════╣ ║  Slash Commands                                                   ║ ║    /help  /tools  /resources  /read <uri>  /prompts              ║ ║    /prompt <name> [key=val]  /servers  /history  /clear          ║ ║    /roots  /roots add <path>  /stream  /export                   ║ ║    /skills  /skill <name|use|pin|off|reload|new>  /plan          ║ ║    /skilldir [path]                                              ║ ╚══════════════════════════════════════════════════════════════════╝ """
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
-# Notification types for real-time server push display
 try:
     from mcp.types import LoggingMessageNotification, ProgressNotification
     HAS_NOTIFICATION_TYPES = True
@@ -36,7 +35,10 @@ from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
-# ── Optional MCP type imports (version-safe) ─────────────────────────────────
+# ── Skills system ─────────────────────────────────────────────────────────────
+from mcp_skills import SkillsManager, SkillDef
+
+# ── Optional MCP type imports (version-safe) ──────────────────────────────────
 try:
     from mcp.types import CreateMessageResult, TextContent
     HAS_SAMPLING = True
@@ -74,6 +76,7 @@ THEME = Theme({
     "log_info":  "cyan",
     "log_warn":  "yellow",
     "log_err":   "red",
+    "skill":     "bold bright_cyan",
 })
 console = Console(theme=THEME, highlight=False)
 
@@ -90,29 +93,22 @@ MAX_HISTORY_TURNS  = int(os.getenv("MAX_HISTORY_TURNS", "10"))
 MAX_TOOL_RESULT_CH = int(os.getenv("MAX_TOOL_RESULT_CHARS", "2000"))
 MAX_DESC_CHARS     = int(os.getenv("MAX_DESC_CHARS", "120"))
 SSL_VERIFY         = os.getenv("SSL_VERIFY", "true").lower() != "false"
-CONFIRM_TOOLS      = os.getenv("CONFIRM_TOOLS", "sensitive")   # always | sensitive | never
-TOOL_TIMEOUT       = int(os.getenv("TOOL_TIMEOUT", "30"))       # seconds per tool call
+CONFIRM_TOOLS      = os.getenv("CONFIRM_TOOLS", "sensitive")
+TOOL_TIMEOUT       = int(os.getenv("TOOL_TIMEOUT", "30"))
 AUTO_LOAD_HISTORY  = os.getenv("AUTO_LOAD_HISTORY", "true").lower() == "true"
 HISTORY_FILE       = Path(os.getenv("HISTORY_FILE",
                          str(Path.home() / ".mcp_client" / "history.json")))
+SKILLS_DIR         = Path(os.getenv("SKILLS_DIR",
+                         str(Path.home() / ".mcp_client" / "skills")))
 SENSITIVE_PATTERNS = [p.strip().lower() for p in os.getenv(
     "SENSITIVE_PATTERNS",
     "disburse,foreclose,delete,remove,drop,grant_waiver,process_payment,"
     "process_foreclosure,mark_loan,reset,wipe,purge,close_loan"
 ).split(",") if p.strip()]
-# SYSTEM_PROMPT   = os.getenv("SYSTEM_PROMPT", (
-#     "You are a highly capable AI assistant with access to tools, resources, and "
-#     "prompt templates from connected MCP servers. Think step by step. "
-#     "Use tools whenever they would help the user. Be concise but thorough."
-# ))
 SYSTEM_PROMPT   = os.getenv("SYSTEM_PROMPT", (
     "You are a highly capable AI assistant with access to tools, resources, and "
     "prompt templates from connected MCP servers. Think step by step. "
-    "Use tools whenever they would help the user. Be concise but thorough. "
-    "CRITICAL: When a tool returns data (lists, records, values), present ONLY "
-    "what the tool actually returned. Never add, infer, guess, or hallucinate "
-    "items not present in the tool response. If a list returns 3 partners, "
-    "show exactly those 3 — nothing more, nothing invented."
+    "Use tools whenever they would help the user. Be concise but thorough."
 ))
 
 log = logging.getLogger("mcp-adv")
@@ -126,7 +122,7 @@ logging.basicConfig(level=logging.WARNING)
 class ServerInfo:
     name:               str
     path:               str
-    session:            Any                    # ClientSession
+    session:            Any
     tools:              list = field(default_factory=list)
     resources:          list = field(default_factory=list)
     resource_templates: list = field(default_factory=list)
@@ -140,23 +136,23 @@ class Turn:
     content:      str
     ts:           datetime      = field(default_factory=datetime.now)
     tool_calls:   list          = field(default_factory=list)
-    tool_call_id: str | None    = None   # set for role='tool' turns
+    tool_call_id: str | None    = None
+
+
+def _now() -> str:
+    return datetime.now().isoformat()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MCP CALLBACK HANDLERS  (Sampling · Elicitation · Logging · Progress)
+# MCP CALLBACK HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MCPCallbacks:
-    """ Implements the client-side half of MCP's server-to-client protocols.  Sampling   — server asks client to run an LLM completion Elicitation— server asks client to collect structured input from user Logging    — server sends log messages to client Progress   — server reports incremental progress """
-
     def __init__(self, get_openai, server_name: str):
         self._get_openai = get_openai
         self.server_name = server_name
 
-    # ── Sampling ─────────────────────────────────────────────────────────────
     async def handle_sampling(self, ctx, request) -> Any:
-        """ Server → Client: 'please run this LLM prompt for me'. We fulfil it using our configured endpoint (Groq / any OpenAI-compat). """
         console.print(f" [sample]⚡ Sampling request from '{self.server_name}'...[/sample]")
         try:
             params = getattr(request, "params", request)
@@ -187,14 +183,11 @@ class MCPCallbacks:
                     stopReason="end_turn",
                 )
             return {"role": "assistant", "content": {"type": "text", "text": text}}
-
         except Exception as exc:
             log.error("Sampling error: %s", exc)
             raise
 
-    # ── Elicitation ───────────────────────────────────────────────────────────
     async def handle_elicitation(self, ctx, request) -> Any:
-        """ Server → Client: 'please collect structured input from the user'. Renders a mini-form in the terminal; returns the filled data. """
         console.print()
         console.print(Panel(
             "[bold]An MCP server needs structured input from you.[/bold]",
@@ -218,7 +211,6 @@ class MCPCallbacks:
                 req   = fname in required
                 label = f"[bold]{fname}[/bold][dim]({'required' if req else 'optional'})[/dim]: {desc}"
                 console.print(f"  {label}")
-
                 try:
                     if ftype == "boolean":
                         collected[fname] = Confirm.ask(f"  → {fname}")
@@ -233,38 +225,29 @@ class MCPCallbacks:
                     collected[fname] = Prompt.ask(f"  → {fname} (raw)")
 
             console.print(f"\n[success]✓ Input collected ({len(collected)} fields)[/success] ")
-
             if HAS_ELICITATION:
                 return ElicitResult(action="accept", content=collected)
             return {"action": "accept", "content": collected}
-
         except (KeyboardInterrupt, EOFError):
             console.print(" [warn]Elicitation cancelled by user[/warn]")
             if HAS_ELICITATION:
                 return ElicitResult(action="cancel")
             return {"action": "cancel"}
 
-    # ── Logging ───────────────────────────────────────────────────────────────
     def handle_log(self, params) -> None:
         level = getattr(params, "level", "info").lower()
         data  = getattr(params, "data", "")
         logger= getattr(params, "logger", "")
         style_map = {
-            "debug":     "log_dbg",
-            "info":      "log_info",
-            "notice":    "log_info",
-            "warning":   "log_warn",
-            "error":     "log_err",
-            "critical":  "log_err",
-            "alert":     "log_err",
-            "emergency": "log_err",
+            "debug": "log_dbg", "info": "log_info", "notice": "log_info",
+            "warning": "log_warn", "error": "log_err",
+            "critical": "log_err", "alert": "log_err", "emergency": "log_err",
         }
         s = style_map.get(level, "log_info")
         tag = f"[{s}][{self.server_name}:{level.upper()}][/{s}]"
         logger_tag = f" [dim]{logger}[/dim]" if logger else ""
         console.print(f"{tag}{logger_tag} {data}")
 
-    # ── Progress ──────────────────────────────────────────────────────────────
     def handle_progress(self, params) -> None:
         token    = getattr(params, "progressToken", "?")
         progress = getattr(params, "progress", 0)
@@ -283,7 +266,6 @@ class MCPCallbacks:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _slim_schema(schema: dict) -> dict:
-    """Strip verbose param descriptions to save tokens."""
     if not isinstance(schema, dict):
         return schema
     slim = {}
@@ -306,7 +288,6 @@ def _slim_schema(schema: dict) -> dict:
 
 def mcp_tool_to_openai(tool) -> dict:
     schema = tool.inputSchema or {"type": "object", "properties": {}}
-    # First line of description only, capped — saves ~60% of schema tokens
     desc = (tool.description or "").split(" ")[0][:MAX_DESC_CHARS]
     return {
         "type": "function",
@@ -319,16 +300,8 @@ def mcp_tool_to_openai(tool) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN CLIENT
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # REAL-TIME NOTIFICATION SESSION
 # ══════════════════════════════════════════════════════════════════════════════
-
-# ── Shared notification renderer (used by both callback and session override) ──
 
 NOTIF_ICONS  = {"debug": "·", "info": "ℹ", "notice": "●",
                 "warning": "⚠", "error": "✗", "critical": "✗✗"}
@@ -337,11 +310,8 @@ NOTIF_STYLES = {"debug": "dim", "info": "cyan", "notice": "blue",
 
 
 def _render_log(srv_name: str, level: str, data: str, logger: str = "") -> None:
-    """ Write a server log line immediately to stdout (no Rich buffering). Called only once per notification via logging_callback. """
-    import sys
     level  = (level or "info").lower()
     icon   = NOTIF_ICONS.get(level, "·")
-    # Guard: logger may arrive as Python None, not missing
     src    = f"[{logger}] " if logger and logger not in ("None", "none") else ""
     sys.stdout.write("  " + icon + " [" + srv_name + "] " + src + data + "\n")
     sys.stdout.flush()
@@ -352,76 +322,80 @@ def _render_progress(progress: int, total: int | None) -> None:
         pct  = int((progress / total) * 100)
         done = pct // 5
         bar  = "█" * done + "░" * (20 - done)
-        import sys
         sys.stdout.write(f"  [{bar}] {pct:3d}%  {progress}/{total}\n")
         sys.stdout.flush()
 
 
 class NotifyingClientSession(ClientSession):
-    """ Subclass of ClientSession that shows server notifications in real-time.  Three-layer interception strategy (most → least reliable): 1. logging_callback  — official SDK param, catches ctx.info/warning/error 2. _received_notification override — catches progress + other notifications 3. post-init monkey-patch — belt-and-suspenders fallback """
-
     def __init__(self, *args, srv_console: Console, srv_name: str = "server", **kwargs):
         self._srv_name    = srv_name
         self._srv_console = srv_console
 
-        # ── Layer 1: inject logging_callback into SDK-supported param ─────────
-        # The MCP SDK calls this for every notifications/message the server sends.
         def _log_cb(params):
             level  = str(getattr(params, "level", "info"))
             data   = str(getattr(params, "data", ""))
             logger = str(getattr(params, "logger", ""))
             _render_log(srv_name, level, data, logger)
 
-        # Accept sync or async callback (SDK version varies)
         async def _async_log_cb(params):
             _log_cb(params)
 
         kwargs.setdefault("logging_callback", _async_log_cb)
         super().__init__(*args, **kwargs)
 
-    # ── Layer 2: _received_notification — progress ONLY (logs go via callback) ──
     async def _received_notification(self, notification) -> None:
-        """ Handles progress bars and resource-change notices. Log messages are intentionally SKIPPED here — logging_callback already handles them. Handling both causes triple-printing. """
         await super()._received_notification(notification)
         try:
             actual = getattr(notification, "root", notification)
             ntype  = type(actual).__name__
-
-            # ⚠ Do NOT handle LoggingMessage here — logging_callback owns it
             if "LoggingMessage" in ntype:
                 return
-
             if "Progress" in ntype:
                 params   = actual.params
                 progress = getattr(params, "progress", 0)
                 total    = getattr(params, "total", None)
                 _render_progress(progress, total)
-
             elif "ResourceUpdated" in ntype:
                 uri = getattr(getattr(actual, "params", None), "uri", "?")
-                import sys
                 sys.stdout.write("  Resource updated: " + str(uri) + "\n")
                 sys.stdout.flush()
-
         except Exception:
             pass
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN CLIENT
+# ══════════════════════════════════════════════════════════════════════════════
+
 class AdvancedMCPClient:
-    """ Ultra-advanced MCP client supporting all eight MCP primitives, multi-server connections, a full agentic tool loop, and a rich slash-command REPL — modelled after Claude Code. """
+    """
+    Ultra-advanced MCP client supporting all eight MCP primitives,
+    multi-server connections, a full agentic tool loop, Skills-based
+    automatic planning, and a rich slash-command REPL.
+    """
 
     def __init__(self):
         self.exit_stack   = AsyncExitStack()
         self._servers:    dict[str, ServerInfo] = {}
-        self._tool_map:   dict[str, ServerInfo] = {}   # tool_name → server
-        self._oai_tools:  list[dict]            = []   # merged openai schemas
-        self._history:    list[Turn]            = []   # conversation turns
-        self._roots:      list[str]             = []   # filesystem roots
+        self._tool_map:   dict[str, ServerInfo] = {}
+        self._oai_tools:  list[dict]            = []
+        self._history:    list[Turn]            = []
+        self._roots:      list[str]             = []
         self._streaming       = False
         self._openai: AsyncOpenAI | None = None
         self._model: str                 = MODEL_NAME
         self._confirm_mode: str          = CONFIRM_TOOLS
         self._tool_timeout: int          = TOOL_TIMEOUT
-        self._cancelled: bool            = False   # set True by Ctrl+C mid-tool
+        self._cancelled: bool            = False
+
+        # ── Skills subsystem ─────────────────────────────────────────────────
+        self._skills = SkillsManager(SKILLS_DIR)
+        _n = self._skills.load()
+        if _n:
+            console.print(
+                f"[skill]✦ Skills loaded: {_n}[/skill]  "
+                f"[dim](dir: {SKILLS_DIR}  |  threshold: {self._skills.AUTO_THRESHOLD})[/dim]"
+            )
 
     # ── OpenAI client ─────────────────────────────────────────────────────────
     def _get_openai(self) -> AsyncOpenAI:
@@ -434,7 +408,6 @@ class AdvancedMCPClient:
 
     # ── Rate-limit aware LLM call ─────────────────────────────────────────────
     async def _llm_call(self, **kwargs) -> Any:
-        """ Wraps chat.completions.create with 429 handling: - Extracts wait time from Groq error message - Auto-retries TPM (per-minute) limit after short wait - For TPD (daily limit): shows model-switch instructions and raises """
         import re as _re, openai as _oai
         for attempt in range(3):
             try:
@@ -450,23 +423,18 @@ class AdvancedMCPClient:
                 kind     = "TPD — daily quota" if is_daily else "TPM — per-minute"
                 console.print(f"[warn]  ⚠  Rate limit ({kind})  |  wait: {wait_str}[/warn]")
                 if is_daily:
-                    console.print("[warn]Daily token limit exhausted.[/warn] ")
-                    console.print("  [cmd]/model mixtral-8x7b-32768[/cmd]    — own 100k TPD")
-                    console.print("  [cmd]/model llama-3.1-8b-instant[/cmd]  — own 500k TPD")
-                    console.print("  [cmd]/model gemma2-9b-it[/cmd]           — own 100k TPD")
-                    console.print(f"  Or wait {wait_str} for reset.")
+                    console.print("[warn]Daily token limit exhausted.[/warn]")
                     raise
                 if attempt < 2 and secs < 120:
-                    console.print(f"[dim]  Retrying in {int(secs)+1}s (attempt {attempt+1}/2)...[/dim]")
+                    console.print(f"[dim]  Retrying in {int(secs)+1}s...[/dim]")
                     await asyncio.sleep(secs + 1)
                 else:
                     raise
             except Exception as exc:
                 if hasattr(exc, "status_code") and getattr(exc, "status_code", 0) == 413:
-                    console.print("[error]Request too large — lower MAX_TOKENS or MAX_HISTORY_TURNS in .env[/error]")
+                    console.print("[error]Request too large[/error]")
                 raise
         raise RuntimeError("Max LLM retries exceeded")
-
 
     # ── Server connection ─────────────────────────────────────────────────────
     async def connect_server(self, script_path: str) -> None:
@@ -487,7 +455,6 @@ class AdvancedMCPClient:
             session_kwargs["elicitation_callback"] = callbacks.handle_elicitation
 
         if is_http:
-            # ── HTTP / SSE transport (remote MCP servers) ─────────────────────
             try:
                 from mcp.client.streamable_http import streamablehttp_client
                 transport = await self.exit_stack.enter_async_context(
@@ -502,12 +469,8 @@ class AdvancedMCPClient:
                     )
                     stdio, write = transport
                 except ImportError:
-                    raise RuntimeError(
-                        "HTTP MCP transport not available. "
-                        "Install: pip install mcp[http]   or   pip install mcp>=1.5"
-                    )
+                    raise RuntimeError("HTTP MCP transport not available.")
         else:
-            # ── stdio transport (local server scripts) ────────────────────────
             if path.suffix == ".py":
                 params = StdioServerParameters(
                     command="uv",
@@ -516,33 +479,28 @@ class AdvancedMCPClient:
             elif path.suffix == ".js":
                 params = StdioServerParameters(command="node", args=[str(path)])
             else:
-                raise ValueError(f"Unsupported server type: {path.suffix}  (.py or .js only)")
+                raise ValueError(f"Unsupported server type: {path.suffix}")
             transport = await self.exit_stack.enter_async_context(stdio_client(params))
             stdio, write = transport
 
         session: ClientSession = await self.exit_stack.enter_async_context(
             NotifyingClientSession(
                 stdio, write,
-                srv_console=console,   # Rich console for real-time output
+                srv_console=console,
                 srv_name=name,
                 **session_kwargs,
             )
         )
         await session.initialize()
 
-        # Tell the server to send ALL log levels (debug+) to this client.
-        # Without this call the server silently drops notifications/message.
         try:
             await session.set_logging_level("debug")
         except Exception:
-            pass   # older servers may not support this — ok to ignore
+            pass
 
-        info = ServerInfo(name=name, path=str(path), session=session)
+        info = ServerInfo(name=name, path=str(path if not is_http else url), session=session)
         self._servers[name] = info
 
-        # ── Discover all primitives ───────────────────────────────────────────
-
-        # Tools
         try:
             resp = await session.list_tools()
             info.tools = resp.tools
@@ -552,39 +510,31 @@ class AdvancedMCPClient:
         except Exception as e:
             log.warning("[%s] tools unavailable: %s", name, e)
 
-        # Resources
         try:
             resp = await session.list_resources()
             info.resources = resp.resources
         except Exception as e:
             log.debug("[%s] resources unavailable: %s", name, e)
 
-        # Resource templates
         try:
             resp = await session.list_resource_templates()
             info.resource_templates = resp.resourceTemplates
         except Exception as e:
             log.debug("[%s] resource templates unavailable: %s", name, e)
 
-        # Prompts
         try:
             resp = await session.list_prompts()
             info.prompts = resp.prompts
         except Exception as e:
             log.debug("[%s] prompts unavailable: %s", name, e)
 
-        # Register notification handlers
         self._register_notifications(session, callbacks)
-
         self._print_server_banner(info)
 
     async def connect_servers(self, paths: list[str]) -> None:
-        """Connect to all servers concurrently."""
         await asyncio.gather(*[self.connect_server(p) for p in paths])
-        log.info("All servers connected. Tools: %s", list(self._tool_map.keys()))
 
     def _register_notifications(self, session: ClientSession, cb: MCPCallbacks) -> None:
-        """Wire up server-push notifications (logging, progress, resource changes)."""
         try:
             @session.set_logging_handler
             async def on_log(params):
@@ -621,7 +571,6 @@ class AdvancedMCPClient:
         return out
 
     async def read_resource(self, uri: str) -> str:
-        """Read a resource by URI — tries all servers until one succeeds."""
         for srv in self._servers.values():
             try:
                 result = await srv.session.read_resource(uri)
@@ -648,15 +597,7 @@ class AdvancedMCPClient:
 
     # ── Prompt helpers ────────────────────────────────────────────────────────
 
-    async def list_all_prompts(self) -> list[tuple[str, Any]]:
-        out = []
-        for srv in self._servers.values():
-            for p in srv.prompts:
-                out.append((srv.name, p))
-        return out
-
     async def get_prompt(self, name: str, arguments: dict | None = None) -> str:
-        """Expand a prompt template and return its text."""
         for srv in self._servers.values():
             for p in srv.prompts:
                 if p.name == name:
@@ -666,7 +607,7 @@ class AdvancedMCPClient:
                         content = msg.content
                         text = getattr(content, "text", str(content))
                         parts.append(f"[{msg.role}]: {text}")
-                    return "\n ".join(parts)
+                    return "\n".join(parts)
         raise ValueError(f"Prompt '{name}' not found in any connected server")
 
     # ── Roots ─────────────────────────────────────────────────────────────────
@@ -676,38 +617,63 @@ class AdvancedMCPClient:
         if resolved not in self._roots:
             self._roots.append(resolved)
             console.print(f"[success]✓ Root added: {resolved}[/success]")
-            # Notify all servers
             for srv in self._servers.values():
                 try:
-                    asyncio.create_task(
-                        srv.session.send_roots_list_changed()
-                    )
+                    asyncio.create_task(srv.session.send_roots_list_changed())
                 except Exception:
                     pass
         else:
             console.print(f"[warn]Root already registered: {resolved}[/warn]")
 
-    # ── Messages helper ───────────────────────────────────────────────────────
+    # ── Messages builder  (injects skill plan into system prompt) ─────────────
 
     def _build_messages(self) -> list[dict]:
-        """ Convert Turn history → OpenAI message dicts. Sliding window of MAX_HISTORY_TURNS keeps token count bounded. Tool-call pairs are kept together to avoid broken message chains. """
-        msgs: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        """
+        Convert Turn history → OpenAI message dicts.
+        Auto-detects the pending user query and injects any matching skill
+        plans as a preamble before the base SYSTEM_PROMPT.
+        """
+        # Find the pending user query (last user turn)
+        pending_query = ""
+        for turn in reversed(self._history):
+            if turn.role == "user":
+                pending_query = turn.content
+                break
+
+        # Build skill plan (returns "" if no skills match)
+        skill_plan = self._skills.build_plan(pending_query) if pending_query else ""
+
+        system_content = SYSTEM_PROMPT
+        if skill_plan:
+            system_content = skill_plan + "\n\n" + SYSTEM_PROMPT
+            fired = self._skills.last_fired
+            if fired:
+                icons = {"pinned": "📌", "auto": "⚡"}
+                labels = []
+                for name in fired:
+                    s = self._skills.skills.get(name)
+                    tag = "📌" if (s and s.pinned) else "⚡"
+                    labels.append(f"{tag}{name}")
+                console.print(
+                    f"[skill]  Skills active: {', '.join(labels)}[/skill]"
+                )
+
+        msgs: list[dict] = [{"role": "system", "content": system_content}]
+
         history = self._history
         if len(history) > MAX_HISTORY_TURNS:
             history = history[-MAX_HISTORY_TURNS:]
-            # Skip orphaned tool results at the start of the window
             while history and history[0].role == "tool":
                 history = history[1:]
+
         for t in history:
             if t.role == "tool":
-                # Tool result — tool_call_id MUST be a top-level field
                 msgs.append({
                     "role":         "tool",
                     "tool_call_id": t.tool_call_id or "",
                     "content":      t.content,
                 })
             elif t.role == "assistant" and t.tool_calls:
-                # Assistant message that requested tool calls — include serialised tool_calls
                 msgs.append({
                     "role":       "assistant",
                     "content":    t.content or None,
@@ -715,19 +681,16 @@ class AdvancedMCPClient:
                 })
             else:
                 msgs.append({"role": t.role, "content": t.content})
+
         return msgs
 
     # ── Tool execution ────────────────────────────────────────────────────────
 
     def _is_sensitive(self, name: str) -> bool:
-        """True if the tool name matches any sensitive pattern."""
         nl = name.lower()
         return any(p in nl for p in SENSITIVE_PATTERNS)
 
     async def _exec_tool(self, name: str, args: dict) -> str:
-        """Execute a tool with confirmation gate, timeout, and cancellation support."""
-
-        # ── Confirmation gate ─────────────────────────────────────────────────
         needs_confirm = (
             self._confirm_mode == "always"
             or (self._confirm_mode == "sensitive" and self._is_sensitive(name))
@@ -747,7 +710,6 @@ class AdvancedMCPClient:
                 console.print("[dim]  ↳ Skipped by user.[/dim]")
                 return f"SKIPPED: User declined to run '{name}'."
 
-        # ── Execute with timeout + cancellation ───────────────────────────────
         srv = self._tool_map.get(name)
         if not srv:
             return f"ERROR: unknown tool '{name}'"
@@ -772,7 +734,7 @@ class AdvancedMCPClient:
             return raw
         except asyncio.TimeoutError:
             console.print(f"[error]  ⏱ Tool '{name}' timed out after {self._tool_timeout}s[/error]")
-            return f"TIMEOUT: '{name}' exceeded {self._tool_timeout}s. Use /timeout to adjust."
+            return f"TIMEOUT: '{name}' exceeded {self._tool_timeout}s."
         except asyncio.CancelledError:
             return f"CANCELLED: '{name}' was cancelled by user."
         except Exception as exc:
@@ -781,7 +743,6 @@ class AdvancedMCPClient:
     # ── Agentic query loop ────────────────────────────────────────────────────
 
     async def process_query(self, user_input: str) -> str:
-        """ Full agentic loop: 1. Append user message 2. Call LLM 3. Execute any tool_calls in parallel 4. Append results, repeat until finish_reason == 'stop' """
         self._history.append(Turn(role="user", content=user_input))
 
         tool_kwargs: dict = {}
@@ -808,7 +769,6 @@ class AdvancedMCPClient:
             msg    = choice.message
             finish = choice.finish_reason
 
-            # Append assistant turn
             self._history.append(Turn(
                 role="assistant",
                 content=msg.content or "",
@@ -819,7 +779,6 @@ class AdvancedMCPClient:
                 final_text = msg.content or ""
                 break
 
-            # Execute all tool calls in parallel
             tc_list = msg.tool_calls
             console.print(f"[tool]⚙ Calling {len(tc_list)} tool(s)...[/tool]")
 
@@ -832,25 +791,26 @@ class AdvancedMCPClient:
             ])
 
             for tc, result in zip(tc_list, results):
-                short = result[:120].replace(" ", " ")
+                short = result[:120].replace("\n", " ")
                 console.print(
                     f"  [tool]●[/tool] [bold]{tc.function.name}[/bold] → [dim]{short}…[/dim]"
                 )
                 self._history.append(Turn(
                     role="tool",
-                    content=result,        # plain text — not wrapped in JSON
-                    tool_call_id=tc.id,   # top-level field, used in _build_messages
+                    content=result,
+                    tool_call_id=tc.id,
                 ))
 
         else:
             console.print(f"[warn]⚠ MAX_TOOL_ROUNDS ({MAX_TOOL_ROUNDS}) reached[/warn]")
 
+        # Clear one-shot skill activations after the turn completes
+        self._skills.clear_activated()
         return final_text
 
     # ── Streaming query ───────────────────────────────────────────────────────
 
     async def stream_query(self, user_input: str) -> str:
-        """Streaming variant — tokens printed as they arrive."""
         self._history.append(Turn(role="user", content=user_input))
 
         tool_kwargs: dict = {}
@@ -882,11 +842,11 @@ class AdvancedMCPClient:
         console.print()
 
         if finish_reason == "tool_calls":
-            # Hand off to full agentic loop for tool execution
             self._history.pop()
             return await self.process_query(user_input)
 
         self._history.append(Turn(role="assistant", content=collected))
+        self._skills.clear_activated()
         return collected
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -898,6 +858,7 @@ class AdvancedMCPClient:
         table.add_column("cmd",  style="cmd",  no_wrap=True)
         table.add_column("desc", style="white")
         rows = [
+            # ── Core ──
             ("/help",               "Show this help"),
             ("/tools",              "List all tools from all servers"),
             ("/resources",          "List all resources"),
@@ -910,15 +871,29 @@ class AdvancedMCPClient:
             ("/clear",              "Reset conversation history"),
             ("/roots",              "List filesystem roots"),
             ("/roots add <path>",   "Add a filesystem root"),
-            ("/stream",             "Toggle streaming on/off"), ("/confirm [mode]",      "Tool confirmation: always | sensitive | never"),
-            ("/timeout [secs]",      "Set per-tool timeout in seconds"),
-            ("/model <name>",        "Switch LLM model without restart"),
-            ("/quota",               "Rate limit info and model quota tips"),
-            ("/save",                "Save conversation to disk"),
-            ("/load",                "Reload last saved conversation"),
-            ("/sessions",            "Show saved session info"),
-            ("/ping [server]",       "Check server reachability"),
+            ("/stream",             "Toggle streaming on/off"),
+            ("/confirm [mode]",     "Tool confirmation: always | sensitive | never"),
+            ("/timeout [secs]",     "Set per-tool timeout in seconds"),
+            ("/model <name>",       "Switch LLM model without restart"),
+            ("/quota",              "Rate limit info and model quota tips"),
+            ("/save",               "Save conversation to disk"),
+            ("/load",               "Reload last saved conversation"),
+            ("/sessions",           "Show saved session info"),
+            ("/ping [server]",      "Check server reachability"),
             ("/export",             "Export conversation to JSON"),
+            # ── Skills ──
+            ("─── Skills ─────────────────────────────────────", ""),
+            ("/skills",             "List all skills with status badges"),
+            ("/skill <name>",       "Show full skill instructions"),
+            ("/skill use <name>",   "Activate skill for NEXT turn only"),
+            ("/skill pin <name>",   "Pin skill as always-on this session"),
+            ("/skill off <name>",   "Disable a skill this session"),
+            ("/skill unpin <name>", "Unpin a pinned skill"),
+            ("/skill reload",       "Rescan skills directory"),
+            ("/skill new <name>",   "Create a new blank skill file"),
+            ("/plan",               "Preview skills that match the last query"),
+            ("/plan <query>",       "Test which skills would fire for a query"),
+            ("/skilldir [path]",    "Show or change the skills directory"),
             ("quit / exit",         "Close the client"),
         ]
         for r in rows:
@@ -947,20 +922,14 @@ class AdvancedMCPClient:
         has_any = False
         for srv in self._servers.values():
             for r in srv.resources:
-                table.add_row(
-                    srv.name,
-                    getattr(r, "name", ""),
-                    getattr(r, "uri", ""),
-                    getattr(r, "mimeType", "") or "",
-                )
+                table.add_row(srv.name, getattr(r, "name", ""),
+                              getattr(r, "uri", ""), getattr(r, "mimeType", "") or "")
                 has_any = True
             for rt in srv.resource_templates:
-                table.add_row(
-                    srv.name,
-                    f"[dim]template:[/dim] {getattr(rt, 'name', '')}",
-                    getattr(rt, "uriTemplate", ""),
-                    getattr(rt, "mimeType", "") or "",
-                )
+                table.add_row(srv.name,
+                              f"[dim]template:[/dim] {getattr(rt, 'name', '')}",
+                              getattr(rt, "uriTemplate", ""),
+                              getattr(rt, "mimeType", "") or "")
                 has_any = True
         if not has_any:
             table.add_row("—", "—", "No resources available", "")
@@ -999,19 +968,14 @@ class AdvancedMCPClient:
                     f"{a.name}{'*' if getattr(a,'required',False) else ''}"
                     for a in (getattr(p, "arguments", None) or [])
                 )
-                table.add_row(
-                    srv.name,
-                    p.name,
-                    (getattr(p, "description", "") or "")[:60],
-                    args,
-                )
+                table.add_row(srv.name, p.name,
+                              (getattr(p, "description", "") or "")[:60], args)
                 has_any = True
         if not has_any:
             table.add_row("—", "—", "No prompts available", "")
         console.print(table)
 
     async def _cmd_prompt(self, raw_args: str) -> None:
-        """ /prompt <name> [key=value ...] Expands the template and injects it as the next user message. """
         parts = raw_args.strip().split()
         if not parts:
             console.print("[warn]Usage: /prompt <name> [key=value ...][/warn]")
@@ -1024,11 +988,7 @@ class AdvancedMCPClient:
                 args[k] = v
         try:
             expanded = await self.get_prompt(name, args)
-            console.print(Panel(
-                expanded,
-                title=f"[prompt_h]Prompt: {name}[/prompt_h]",
-                border_style="cyan",
-            ))
+            console.print(Panel(expanded, title=f"[prompt_h]Prompt: {name}[/prompt_h]", border_style="cyan"))
             inject = Confirm.ask("Inject this prompt into the conversation?", default=True)
             if inject:
                 self._history.append(Turn(role="user", content=expanded))
@@ -1044,13 +1004,9 @@ class AdvancedMCPClient:
         table.add_column("Resources", justify="right", style="resource")
         table.add_column("Prompts",   justify="right", style="prompt_h")
         for srv in self._servers.values():
-            table.add_row(
-                srv.name,
-                srv.path,
-                str(len(srv.tools)),
-                str(len(srv.resources) + len(srv.resource_templates)),
-                str(len(srv.prompts)),
-            )
+            table.add_row(srv.name, srv.path, str(len(srv.tools)),
+                          str(len(srv.resources) + len(srv.resource_templates)),
+                          str(len(srv.prompts)))
         if not self._servers:
             table.add_row("—", "—", "—", "—", "—")
         console.print(table)
@@ -1059,19 +1015,15 @@ class AdvancedMCPClient:
         if not self._history:
             console.print("[dim]No history yet.[/dim]")
             return
-        for i, turn in enumerate(self._history):
+        for turn in self._history:
             ts = turn.ts.strftime("%H:%M:%S")
             if turn.role == "user":
-                console.print(Panel(
-                    turn.content, title=f"[user_c]You[/user_c]  [dim]{ts}[/dim]",
-                    border_style="green",
-                ))
+                console.print(Panel(turn.content,
+                    title=f"[user_c]You[/user_c]  [dim]{ts}[/dim]", border_style="green"))
             elif turn.role == "assistant":
                 console.print(Panel(
                     Markdown(turn.content) if turn.content else "[dim](tool call only)[/dim]",
-                    title=f"[asst]Assistant[/asst]  [dim]{ts}[/dim]",
-                    border_style="cyan",
-                ))
+                    title=f"[asst]Assistant[/asst]  [dim]{ts}[/dim]", border_style="cyan"))
 
     def _cmd_roots(self, arg: str = "") -> None:
         if arg.startswith("add "):
@@ -1086,20 +1038,226 @@ class AdvancedMCPClient:
     def _cmd_export(self) -> None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = f"conversation_{ts}.json"
-        data = [
-            {"role": t.role, "content": t.content, "ts": t.ts.isoformat()}
-            for t in self._history
-        ]
+        data = [{"role": t.role, "content": t.content, "ts": t.ts.isoformat()}
+                for t in self._history]
         Path(fname).write_text(json.dumps(data, indent=2, ensure_ascii=False))
         console.print(f"[success]✓ Exported {len(data)} turns → {fname}[/success]")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # MAIN REPL
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Skills slash commands ─────────────────────────────────────────────────
 
-    # ── Conversation persistence ─────────────────────────────────────────────
+    def _cmd_skills(self) -> None:
+        """
+        /skills — show all loaded skills with status, triggers, description.
+        """
+        table = Table(
+            title=f"[bold]Skills[/bold]  [dim]({self._skills.skills_dir})[/dim]",
+            box=box.ROUNDED,
+            border_style="bright_cyan",
+        )
+        table.add_column("Status",   style="dim",       no_wrap=True, width=14)
+        table.add_column("Name",     style="bold cyan",  no_wrap=True)
+        table.add_column("Pri",      justify="center",   width=4)
+        table.add_column("Triggers", style="dim",        max_width=28)
+        table.add_column("Description", style="white",  max_width=46)
+
+        if not self._skills.skills:
+            table.add_row("—", "No skills loaded", "—", "—",
+                          f"dir: {self._skills.skills_dir}")
+        else:
+            for skill in sorted(self._skills.skills.values(), key=lambda s: -s.priority):
+                if skill.pinned:
+                    status = "[bold magenta]📌 pinned[/bold magenta]"
+                elif skill.disabled:
+                    status = "[red]🔴 disabled[/red]"
+                else:
+                    status = "[green]⚪ auto[/green]"
+                trig = ", ".join(skill.triggers[:4])
+                if len(skill.triggers) > 4:
+                    trig += f" +{len(skill.triggers)-4}"
+                table.add_row(status, skill.name, str(skill.priority),
+                              trig, skill.description[:46])
+        console.print(table)
+        console.print(
+            "[dim]  /skill <name>       view · /skill use <name>  activate once\n"
+            "  /skill pin <name>   always-on · /skill off <name>  disable\n"
+            "  /skill reload       rescan · /skill new <name>  create[/dim]"
+        )
+
+    async def _cmd_skill(self, raw_args: str) -> None:
+        """
+        /skill <name>          — show full skill body
+        /skill use <name>      — activate for next turn
+        /skill pin <name>      — pin (always-on) this session
+        /skill off <name>      — disable this session
+        /skill unpin <name>    — unpin
+        /skill reload          — rescan directory
+        /skill new <name>      — create blank skill file
+        """
+        parts  = raw_args.strip().split(None, 1)
+        if not parts:
+            self._cmd_skills()
+            return
+
+        subcmd = parts[0].lower()
+        arg    = parts[1].strip() if len(parts) > 1 else ""
+
+        if subcmd == "reload":
+            n = self._skills.reload()
+            console.print(f"[success]✓ Skills reloaded: {n} found[/success]")
+            return
+
+        if subcmd == "new":
+            if not arg:
+                console.print("[warn]Usage: /skill new <name>[/warn]")
+                return
+            safe_name = arg.lower().replace(" ", "_")
+            fname  = safe_name + ".md"
+            target = self._skills.skills_dir / fname
+            if target.exists():
+                console.print(f"[warn]Already exists: {target}[/warn]")
+            else:
+                target.write_text(
+                    f"---\nname: {safe_name}\n"
+                    f"description: {arg}\n"
+                    f"triggers: [{arg.lower()}]\npriority: 5\n---\n\n"
+                    f"## {arg}\n\nAdd your step-by-step instructions here.\n",
+                    encoding="utf-8",
+                )
+                console.print(f"[success]✓ Created: {target}[/success]")
+                console.print(f"[dim]  Edit the file, then /skill reload[/dim]")
+            return
+
+        if subcmd == "use":
+            if self._skills.activate(arg):
+                console.print(f"[success]✓ '{arg}' activated for next turn[/success]")
+            else:
+                console.print(f"[warn]Skill '{arg}' not found (use /skills to list)[/warn]")
+            return
+
+        if subcmd == "pin":
+            if self._skills.pin(arg):
+                console.print(f"[success]✓ '{arg}' pinned — always-on this session[/success]")
+            else:
+                console.print(f"[warn]Skill '{arg}' not found[/warn]")
+            return
+
+        if subcmd in ("off", "disable"):
+            if self._skills.disable(arg):
+                console.print(f"[warn]  '{arg}' disabled this session[/warn]")
+            else:
+                console.print(f"[warn]Skill '{arg}' not found[/warn]")
+            return
+
+        if subcmd == "unpin":
+            if self._skills.unpin(arg):
+                console.print(f"[success]✓ '{arg}' unpinned[/success]")
+            else:
+                console.print(f"[warn]Skill '{arg}' not found[/warn]")
+            return
+
+        # Default: show skill content (subcmd IS the skill name)
+        name  = subcmd
+        skill = self._skills._get(name)
+        if not skill:
+            matches = [s for s in self._skills.skills.values() if name in s.name]
+            if len(matches) == 1:
+                skill = matches[0]
+            elif matches:
+                console.print(f"[warn]Ambiguous: {', '.join(m.name for m in matches)}[/warn]")
+                return
+            else:
+                console.print(f"[warn]Skill '{name}' not found — use /skills to list[/warn]")
+                return
+
+        header = (
+            f"[bold]Name:[/bold] {skill.name}  "
+            f"[bold]Priority:[/bold] {skill.priority}  "
+            f"[bold]Triggers:[/bold] {', '.join(skill.triggers)}\n"
+            f"[bold]File:[/bold] [dim]{skill.path}[/dim]\n"
+            f"[bold]Status:[/bold] "
+            + ("📌 pinned" if skill.pinned else "🔴 disabled" if skill.disabled else "⚪ auto")
+            + f"\n[bold]Description:[/bold] {skill.description}"
+        )
+        console.print(Panel(header, title=f"[bold cyan]Skill: {skill.name}[/bold cyan]",
+                            border_style="cyan"))
+        console.print(Panel(
+            Syntax(skill.body, "markdown", theme="monokai", word_wrap=True),
+            title="[dim]Instructions[/dim]",
+            border_style="dim",
+        ))
+
+    def _cmd_plan(self, test_query: str = "") -> None:
+        """
+        /plan           — preview skills for the last user message
+        /plan <query>   — test skills against an arbitrary query
+        """
+        query = test_query.strip()
+        if not query:
+            for turn in reversed(self._history):
+                if turn.role == "user":
+                    query = turn.content
+                    break
+
+        if not query:
+            console.print("[dim]No query yet. Type a message first or: /plan <test query>[/dim]")
+            return
+
+        # Score all skills and show full table
+        scored = [
+            (s.score(query), s)
+            for s in self._skills.skills.values()
+        ]
+        scored.sort(key=lambda x: -x[0])
+
+        table = Table(
+            title=f"[bold]Skill Plan Preview[/bold]\n[dim]query: {query[:80]}[/dim]",
+            box=box.ROUNDED,
+            border_style="bright_cyan",
+        )
+        table.add_column("Score",  justify="right", width=6, style="cyan")
+        table.add_column("Fire?",  justify="center", width=6)
+        table.add_column("Name",   style="bold")
+        table.add_column("Pri",    justify="center", width=4)
+        table.add_column("Triggers", style="dim", max_width=35)
+
+        threshold = self._skills.AUTO_THRESHOLD
+        for score, skill in scored:
+            will_fire = (
+                skill.pinned or
+                skill.activated or
+                (not skill.disabled and score >= threshold)
+            )
+            fire_badge = "[green]✓ YES[/green]" if will_fire else "[dim]—[/dim]"
+            if skill.disabled:
+                fire_badge = "[red]OFF[/red]"
+            table.add_row(
+                f"{score:.2f}",
+                fire_badge,
+                skill.name,
+                str(skill.priority),
+                ", ".join(skill.triggers[:4]),
+            )
+        console.print(table)
+        console.print(
+            f"[dim]  Auto-threshold: {threshold}  |  "
+            f"MAX_SKILLS_PER_TURN: {self._skills.MAX_SKILLS_PER_TURN}[/dim]"
+        )
+
+    def _cmd_skilldir(self, arg: str) -> None:
+        if not arg:
+            console.print(
+                f"[bold]Skills dir:[/bold] {self._skills.skills_dir}  "
+                f"[dim]({len(self._skills.skills)} skills loaded)[/dim]"
+            )
+            return
+        new_dir = Path(arg).expanduser().resolve()
+        self._skills = SkillsManager(new_dir)
+        n = self._skills.load()
+        console.print(f"[success]✓ Skills dir → {new_dir}  ({n} loaded)[/success]")
+
+    # ── Conversation persistence ──────────────────────────────────────────────
+
     def _save_history(self) -> None:
-        """Persist conversation history to disk."""
         try:
             HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
             data = {
@@ -1107,18 +1265,16 @@ class AdvancedMCPClient:
                 "saved":   _now(),
                 "turns":   [
                     {"role": t.role, "content": t.content,
-                     "ts": t.ts.isoformat(),
-                     "tool_call_id": t.tool_call_id}
+                     "ts": t.ts.isoformat(), "tool_call_id": t.tool_call_id}
                     for t in self._history
                 ],
             }
             HISTORY_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-            console.print(f"[dim]  History saved → {HISTORY_FILE} ({len(self._history)} turns)[/dim]")
+            console.print(f"[dim]  History saved ({len(self._history)} turns)[/dim]")
         except Exception as exc:
             console.print(f"[warn]  Could not save history: {exc}[/warn]")
 
     def _load_history(self) -> bool:
-        """Load persisted conversation history from disk. Returns True if loaded."""
         try:
             if not HISTORY_FILE.exists():
                 return False
@@ -1128,25 +1284,26 @@ class AdvancedMCPClient:
                 return False
             self._history = [
                 Turn(
-                    role=t["role"],
-                    content=t["content"],
+                    role=t["role"], content=t["content"],
                     ts=datetime.fromisoformat(t.get("ts", _now())),
                     tool_call_id=t.get("tool_call_id"),
                 )
                 for t in turns
             ]
-            saved_model = data.get("model", "")
             console.print(
                 f"[success]✓ Loaded {len(self._history)} turns from previous session[/success] "
-                f"[dim]({data.get('saved','?')} | model: {saved_model})[/dim]"
+                f"[dim]({data.get('saved','?')} | model: {data.get('model','?')})[/dim]"
             )
             return True
         except Exception as exc:
             console.print(f"[warn]  Could not load history: {exc}[/warn]")
             return False
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # MAIN REPL
+    # ══════════════════════════════════════════════════════════════════════════
+
     async def chat_loop(self) -> None:
-        # Auto-load history
         if AUTO_LOAD_HISTORY:
             self._load_history()
 
@@ -1156,10 +1313,9 @@ class AdvancedMCPClient:
                          "never": "[dim]CONFIRM:OFF[/dim]"}[self._confirm_mode]
         console.print()
         console.print(Rule(
-            f"[server]MCP Client[/server]  "
-            f"[bold]{self._model}[/bold]  "
-            f"{mode}  {confirm_badge}  "
-            f"[dim]timeout:{self._tool_timeout}s[/dim]"
+            f"[server]MCP Client[/server]  [bold]{self._model}[/bold]  "
+            f"{mode}  {confirm_badge}  [dim]timeout:{self._tool_timeout}s[/dim]  "
+            f"[skill]skills:{len(self._skills.skills)}[/skill]"
         ))
         servers_line = "  ".join(
             f"[server]{n}[/server]([tool]{len(s.tools)}T[/tool]/"
@@ -1169,7 +1325,8 @@ class AdvancedMCPClient:
         )
         if servers_line:
             console.print(f"[dim]Servers: {servers_line}[/dim]")
-        console.print(f"[dim]Type [bold]/help[/bold]  ·  Ctrl+C to cancel tool  ·  [bold]quit[/bold] to exit[/dim] ")
+        console.print(f"[dim]Type [bold]/help[/bold]  ·  [bold]/skills[/bold]  ·  "
+                      f"Ctrl+C cancels tool  ·  [bold]quit[/bold] exits[/dim] ")
 
         while True:
             try:
@@ -1181,7 +1338,6 @@ class AdvancedMCPClient:
             if not raw:
                 continue
 
-            # ── Exit ─────────────────────────────────────────────────────────
             if raw.lower() in ("quit", "exit", "q"):
                 console.print("[dim]Closing...[/dim]")
                 break
@@ -1214,55 +1370,49 @@ class AdvancedMCPClient:
                         console.print("[success]✓ History cleared[/success]")
                     elif cmd == "roots":
                         self._cmd_roots(rest.strip())
+
+                    # ── Skills commands ───────────────────────────────────────
+                    elif cmd == "skills":
+                        self._cmd_skills()
+                    elif cmd == "skill":
+                        await self._cmd_skill(rest)
+                    elif cmd == "plan":
+                        self._cmd_plan(rest)       # /plan OR /plan <test query>
+                    elif cmd == "skilldir":
+                        self._cmd_skilldir(rest.strip())
+
                     elif cmd == "model":
                         if not rest.strip():
-                            console.print(
-                                f"Current model: [bold]{self._model}[/bold] "
-                                "Available Groq models (each has its own TPD quota): "
-                                "  [cmd]llama-3.3-70b-versatile[/cmd]       ← best quality "
-                                "  [cmd]mixtral-8x7b-32768[/cmd]             ← fast, 32k context "
-                                "  [cmd]llama-3.1-8b-instant[/cmd]           ← fastest, low token cost "
-                                "  [cmd]gemma2-9b-it[/cmd]                   ← lightweight "
-                                "  [cmd]llama3-groq-70b-8192-tool-use-preview[/cmd]  ← tool-tuned  "
-                                "Usage: [cmd]/model mixtral-8x7b-32768[/cmd]"
-                            )
+                            console.print(f"Current: [bold]{self._model}[/bold]\n"
+                                          "  Usage: [cmd]/model <name>[/cmd]")
                         else:
                             self._model = rest.strip()
-                            # Reset client so new model takes effect immediately
                             if self._openai:
                                 await self._openai.close()
                                 self._openai = None
-                            console.print(f"[success]✓ Model switched to: {self._model}[/success]")
-                            console.print("[dim]  Client reset — next call uses the new model.[/dim]")
+                            console.print(f"[success]✓ Model → {self._model}[/success]")
                     elif cmd == "quota":
                         console.print(
-                            f"Model      : [bold]{self._model}[/bold] "
-                            f"Base URL   : [dim]{OPENAI_BASE_URL}[/dim]  "
-                            "[bold]Groq Free Tier Limits:[/bold]"
-                            "  TPM (tokens/min) : 12,000  ← hit during heavy tool use "
-                            "  TPD (tokens/day) : 100,000 ← hit after sustained testing  "
-                            "[bold]When you hit TPD:[/bold]"
-                            "  Each model has its OWN daily quota. Switch to a fresh one: "
-                            "  [cmd]/model mixtral-8x7b-32768[/cmd]   → separate 100k TPD "
-                            "  [cmd]/model llama-3.1-8b-instant[/cmd] → separate 500k TPD  "
-                            "[bold]Permanent fix:[/bold] Upgrade to Groq Dev Tier at console.groq.com/billing"
+                            f"Model: [bold]{self._model}[/bold]  "
+                            f"URL: [dim]{OPENAI_BASE_URL}[/dim]\n"
+                            "Groq free: 12k TPM · 100k TPD per model\n"
+                            "Switch: [cmd]/model mixtral-8x7b-32768[/cmd]  "
+                            "or  [cmd]/model llama-3.1-8b-instant[/cmd]"
                         )
                     elif cmd == "confirm":
                         modes = ("always", "sensitive", "never")
                         if rest.strip().lower() in modes:
                             self._confirm_mode = rest.strip().lower()
-                            console.print(f"[success]✓ Confirmation mode: {self._confirm_mode}[/success]")
+                            console.print(f"[success]✓ Confirmation: {self._confirm_mode}[/success]")
                         else:
-                            console.print(f"Current: [bold]{self._confirm_mode}[/bold]")
-                            console.print("  [cmd]/confirm always[/cmd]     confirm every tool call")
-                            console.print("  [cmd]/confirm sensitive[/cmd]  confirm destructive tools only (default)")
-                            console.print("  [cmd]/confirm never[/cmd]      auto-execute all tools (use with care)")
+                            console.print(f"Current: [bold]{self._confirm_mode}[/bold]\n"
+                                          "  always | sensitive | never")
                     elif cmd == "timeout":
                         if rest.strip().isdigit():
                             self._tool_timeout = int(rest.strip())
-                            console.print(f"[success]✓ Tool timeout: {self._tool_timeout}s[/success]")
+                            console.print(f"[success]✓ Timeout: {self._tool_timeout}s[/success]")
                         else:
-                            console.print(f"Current timeout: [bold]{self._tool_timeout}s[/bold]  Usage: /timeout 60")
+                            console.print(f"Current: {self._tool_timeout}s  Usage: /timeout 60")
                     elif cmd == "save":
                         self._save_history()
                     elif cmd == "load":
@@ -1270,17 +1420,13 @@ class AdvancedMCPClient:
                     elif cmd == "sessions":
                         f = HISTORY_FILE
                         if f.exists():
-                            import json as _j
-                            d = _j.loads(f.read_text())
+                            d = json.loads(f.read_text())
                             console.print(
-                                f"[bold]Saved session[/bold]  {f} "
-                                f"  Turns : {len(d.get('turns', []))} "
-                                f"  Model : {d.get('model','?')} "
-                                f"  Saved : {d.get('saved','?')} "
-                                "Use [cmd]/load[/cmd] to restore."
+                                f"File: {f}\nTurns: {len(d.get('turns',[]))}  "
+                                f"Model: {d.get('model','?')}  Saved: {d.get('saved','?')}"
                             )
                         else:
-                            console.print(f"[dim]No saved session found at {HISTORY_FILE}[/dim]")
+                            console.print(f"[dim]No saved session at {HISTORY_FILE}[/dim]")
                     elif cmd == "ping":
                         target = rest.strip() or None
                         for sname, srv in self._servers.items():
@@ -1315,14 +1461,12 @@ class AdvancedMCPClient:
                         title="[asst]Assistant[/asst]",
                         border_style="cyan",
                     ))
-                # Auto-save after every turn
                 self._save_history()
             except KeyboardInterrupt:
                 if query_task:
                     query_task.cancel()
                 self._cancelled = True
-                console.print(" [warn]  ⚡ Cancelled — current tool/LLM call aborted[/warn]")
-                # Remove the incomplete user turn from history
+                console.print(" [warn]  ⚡ Cancelled[/warn]")
                 if self._history and self._history[-1].role == "user":
                     self._history.pop()
             except Exception as exc:
@@ -1342,8 +1486,22 @@ class AdvancedMCPClient:
 
 def _print_usage() -> None:
     console.print(Panel(
-        textwrap.dedent("""\ [bold]Usage:[/bold] python mcp_client_advanced.py <server.py> [server2.py ...] [--stream]  [bold]Env / .env:[/bold] OPENAI_BASE_URL   your endpoint  (default: Groq) OPENAI_API_KEY    API key  [required] MODEL_NAME        model name MAX_TOKENS        max tokens per call  (default 4096) MAX_TOOL_ROUNDS   agentic loop cap     (default 10) SSL_VERIFY        false to skip TLS    (default true) SYSTEM_PROMPT     override system prompt """),
-        title="[server]Advanced MCP Client[/server]",
+        textwrap.dedent("""\
+ [bold]Usage:[/bold]  python mcp_client_advanced.py <server.py> [server2.py ...] [--stream]
+
+ [bold]Env / .env:[/bold]
+   OPENAI_BASE_URL        your endpoint  (default: Groq)
+   OPENAI_API_KEY         API key  [required]
+   MODEL_NAME             model name
+   MAX_TOKENS             max tokens per call        (default 4096)
+   MAX_TOOL_ROUNDS        agentic loop cap           (default 10)
+   SSL_VERIFY             false to skip TLS          (default true)
+   SKILLS_DIR             path to skills folder      (default ~/.mcp_client/skills)
+   SKILL_AUTO_THRESHOLD   score threshold 0-1        (default 0.30)
+   MAX_SKILLS_PER_TURN    cap on auto-fired skills   (default 3)
+   SYSTEM_PROMPT          override base system prompt
+"""),
+        title="[server]Advanced MCP Client  +  Skills[/server]",
         border_style="dim",
     ))
 
@@ -1358,7 +1516,7 @@ async def main() -> None:
     server_paths = [a for a in args if not a.startswith("--")]
 
     if not OPENAI_API_KEY:
-        console.print("[error]OPENAI_API_KEY is not set. Add it to your .env file.[/error]")
+        console.print("[error]OPENAI_API_KEY is not set.[/error]")
         sys.exit(1)
 
     client = AdvancedMCPClient()
